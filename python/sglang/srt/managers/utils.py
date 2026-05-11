@@ -260,6 +260,11 @@ class EmbeddingBatchResult:
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[torch.cuda.Event] = None
 
+    @property
+    def can_run_cuda_graph(self) -> bool:
+        # Embedding/classification forward never runs through a cuda graph.
+        return False
+
     def copy_to_cpu(self):
         """Copy embeddings and pooled hidden states to CPU for overlap scheduling."""
         if isinstance(self.embeddings, torch.Tensor):
