@@ -73,6 +73,14 @@ class SchedulerPPMixin:
         """
         self.init_pp_loop_state()
         while True:
+            # Barrier: schedule_stream GPU ops in this outer iter happen-after
+            # forward_stream's latest launch from the previous outer iter.
+            # PP's per-microbatch cycle already serializes prep(mb_X) iter k+1
+            # behind process_result(mb_X) iter k, so this is mainly defense
+            # against any mid-iter rebind (spec V2 etc.) that touches state
+            # shared with forward_stream.
+            self.schedule_stream.wait_stream(self.forward_stream)
+
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
@@ -201,6 +209,10 @@ class SchedulerPPMixin:
         send_release_work = []
 
         while True:
+            # Barrier: same intent as event_loop_pp — schedule_stream GPU ops
+            # in this outer iter happen-after forward_stream's latest launch.
+            self.schedule_stream.wait_stream(self.forward_stream)
+
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
@@ -346,6 +358,10 @@ class SchedulerPPMixin:
         send_release_work = []
 
         while True:
+            # Barrier: same intent as event_loop_pp — schedule_stream GPU ops
+            # in this outer iter happen-after forward_stream's latest launch.
+            self.schedule_stream.wait_stream(self.forward_stream)
+
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
