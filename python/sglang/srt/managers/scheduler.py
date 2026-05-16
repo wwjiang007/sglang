@@ -1575,22 +1575,7 @@ class Scheduler(
 
     @DynamicGradMode()
     def event_loop_overlap(self):
-        """A scheduler loop that overlaps the CPU processing and GPU computation.
-
-        Iteration shape (strict guard):
-          1. process forward N's result (cache_finished_req etc.) — happens-after
-             forward N because pop_and_process awaits copy_done internally
-          2. schedule_stream.wait_stream(forward_stream) — schedule_stream's GPU
-             ops in iter N+1 wait for forward N to finish on forward_stream;
-             single-point barrier, narrowable later if partial-defer is wanted
-          3. get_next_batch_to_run — runs the iter N+1 schedule mutations
-             (kv_committed_len += 1, seq_lens = seq_lens + 1, slot alloc, ...)
-             which now see post-process(N) state and have a barrier in front of
-             every schedule_stream GPU op
-          4. run_batch — launches forward N+1 on forward_stream (run_batch
-             internally does forward_stream.wait_stream(schedule_stream) so
-             forward N+1 sees the schedule prep)
-        """
+        """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -1607,29 +1592,39 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            # 1. Process forward N's result before scheduling N+1, so any
-            # cache_finished_req(N) etc. reads pre-mutation state.
-            if self.last_batch:
-                pop_and_process()
-
-            # 2. Barrier: schedule_stream's GPU ops happen-after forward N.
+            # Barrier: schedule_stream's GPU ops in this iter (seq_lens
+            # mutations, slot allocs, mamba gathers, ...) happen-after the
+            # previous iter's forward on forward_stream. Single-point so a
+            # future partial-defer pass can narrow to per-op fences.
             self.schedule_stream.wait_stream(self.forward_stream)
 
-            # 3. Get the next batch to run
+            # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
-            # 4. Launch the current batch
+            # If we do not need to overlap the current batch with the last batch,
+            # we can process the last batch immediately.
+            if disable_overlap_for_batch:
+                pop_and_process()
+
+            # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
-                if self.last_batch is None:
-                    # Idle path: nothing in flight either, do self-check / re-init.
-                    self.on_idle()
 
-            # Run sample of the current batch (delayed-sample path)
+            # Process the last batch
+            if self.last_batch:
+                if not disable_overlap_for_batch:
+                    pop_and_process()
+            elif batch is None:
+                # When the server is idle, do self-check and re-init some states
+                self.on_idle()
+
+            # Run sample of the current batch
+            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result)
 
@@ -1638,6 +1633,39 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+
+    def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
+        # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
+        # This might slightly hurt the throughput, so we use an environment variable to control it.
+        # In DP attention mode, use the globally synchronized is_extend_in_batch
+        # so all DP ranks make the same overlap decision (avoiding deadlock).
+        # In non-DP mode, use the local forward_mode directly.
+        if self.require_mlp_sync:
+            is_extend = lambda b: b and b.is_extend_in_batch
+        else:
+            is_extend = lambda b: b and b.forward_mode.is_extend()
+
+        batch_is_extend = is_extend(batch)
+        last_batch_is_extend = is_extend(self.last_batch)
+
+        disable_overlap_for_batch = (
+            envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
+            and batch_is_extend
+            and last_batch_is_extend
+        )
+
+        # We do not support overlap + spec + grammar yet,
+        # so we need to turn off overlap for this batch.
+        # TODO(lsyin): support overlap + spec + grammar
+        need_grammar_sync = (
+            batch
+            and batch.is_spec_v2
+            and batch.has_grammar
+            and batch.forward_mode.is_decode()
+            and len(self.result_queue) > 0
+        )
+
+        return disable_overlap_for_batch or need_grammar_sync
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
