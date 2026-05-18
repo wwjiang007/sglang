@@ -3110,19 +3110,6 @@ class Scheduler(
                     # FIXME(lsyin): tmp code for spec v2
                     # We only keep future indices for next draft input
 
-                    # Mark the about-to-be-replaced GPU tensors as still-in-use
-                    # by forward_stream, so the caching allocator does not
-                    # recycle their memory while forward N (which read them)
-                    # is still running. Without this, the rebinds below drop
-                    # the only schedule-side ref and the allocator's pending
-                    # set only contains schedule_stream — forward_stream is
-                    # not waited on before reuse.
-                    if (
-                        batch.seq_lens is not None
-                        and batch.seq_lens.device.type != "cpu"
-                    ):
-                        batch.seq_lens.record_stream(self.forward_stream)
-
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
 
